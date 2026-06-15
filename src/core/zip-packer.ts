@@ -1,4 +1,4 @@
-import type { CreateZipPayload } from '@/types'
+import type { CreateZipPayload, SplitVolumeFile } from '@/types'
 import { ZIP_SIGNATURES, COMPRESSION_METHOD, ZIP_FLAG_BITS, AES_MODES } from './constants'
 import { crc32, encryptAES256Stream, encryptZipCryptoStream } from './crypto'
 
@@ -458,6 +458,188 @@ export async function createZipArchive(
 
   const finalData = concatUint8Arrays(allChunks)
   return new Blob([finalData], { type: 'application/zip' })
+}
+
+export async function createSplitZipArchive(
+  payload: CreateZipPayload,
+  onProgress?: (bytesProcessed: number, totalBytes: number, filesCompleted: number, totalFiles: number) => void
+): Promise<{
+  blob: Blob
+  splitVolumes: SplitVolumeFile[]
+}> {
+  const { files, password, encryptionMode, compressionLevel, splitVolumeSize } = payload
+  const volumeSize = splitVolumeSize || 100 * 1024 * 1024
+
+  const totalFiles = files.length
+  const totalUncompressedBytes = files.reduce((sum, f) => sum + f.size, 0)
+
+  let processedFiles = 0
+  let processedBytes = 0
+
+  const compressionMethod = compressionLevel > 0 ? COMPRESSION_METHOD.DEFLATED : COMPRESSION_METHOD.STORED
+
+  const fileResults: Array<{
+    info: ZipEntryInfo
+    localHeader: Uint8Array
+    fileData: Uint8Array
+  }> = []
+
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i]
+    const result = await processFile(file, {
+      compressionMethod,
+      encryptionMode,
+      password
+    })
+
+    const localHeader = writeLocalFileHeader({
+      ...result.info,
+      offset: 0
+    })
+    const fileData = await readStreamToBytes(result.dataStream)
+
+    fileResults.push({
+      info: result.info,
+      localHeader,
+      fileData
+    })
+
+    processedFiles++
+    processedBytes += result.info.uncompressedSize
+
+    onProgress?.(
+      processedBytes,
+      totalUncompressedBytes,
+      processedFiles,
+      totalFiles
+    )
+    await new Promise(resolve => setTimeout(resolve, 0))
+  }
+
+  const entryInfos: ZipEntryInfo[] = []
+  let currentOffset = 0
+
+  for (const { info, localHeader, fileData } of fileResults) {
+    entryInfos.push({
+      ...info,
+      offset: currentOffset
+    })
+    currentOffset += localHeader.length + fileData.length
+  }
+
+  const centralDirChunks: Uint8Array[] = []
+  for (const info of entryInfos) {
+    const entry = writeCentralDirectoryEntry(info)
+    centralDirChunks.push(entry)
+  }
+  const centralDirData = concatUint8Arrays(centralDirChunks)
+  const centralDirSize = centralDirData.length
+  const centralDirOffset = currentOffset
+
+  const eocd = writeEndOfCentralDirectory(
+    entryInfos.length,
+    entryInfos.length,
+    centralDirSize,
+    centralDirOffset
+  )
+
+  const totalLocalDataSize = currentOffset
+  const metadataSize = centralDirSize + eocd.length
+
+  const dataPieces: { bytes: Uint8Array; type: 'header' | 'data' }[] = []
+  for (const { localHeader, fileData } of fileResults) {
+    dataPieces.push({ bytes: localHeader, type: 'header' })
+    dataPieces.push({ bytes: fileData, type: 'data' })
+  }
+
+  const volumes: Uint8Array[][] = [[]]
+  let currentVolumeSize = 0
+
+  for (const piece of dataPieces) {
+    const pieceSize = piece.bytes.length
+
+    if (currentVolumeSize + pieceSize <= volumeSize || volumes[volumes.length - 1].length === 0) {
+      volumes[volumes.length - 1].push(piece.bytes)
+      currentVolumeSize += pieceSize
+    } else {
+      if (pieceSize <= volumeSize) {
+        volumes.push([piece.bytes])
+        currentVolumeSize = pieceSize
+      } else {
+        let offset = 0
+        while (offset < piece.bytes.length) {
+          const remaining = piece.bytes.length - offset
+          const spaceLeft = volumeSize - currentVolumeSize
+          const chunkSize = Math.min(spaceLeft || volumeSize, remaining)
+
+          if (spaceLeft <= 0 && volumes[volumes.length - 1].length > 0) {
+            volumes.push([])
+            currentVolumeSize = 0
+          }
+
+          const chunk = piece.bytes.slice(offset, offset + chunkSize)
+          volumes[volumes.length - 1].push(chunk)
+          currentVolumeSize += chunkSize
+          offset += chunkSize
+        }
+      }
+    }
+  }
+
+  const splitVolumes: SplitVolumeFile[] = []
+  const totalVolumes = volumes.length + (metadataSize > 0 ? 1 : 0)
+
+  for (let i = 0; i < volumes.length; i++) {
+    const volumeData = concatUint8Arrays(volumes[i])
+    const volumeIndex = i + 1
+    const isLast = i === volumes.length - 1 && metadataSize === 0
+    const volumeName = isLast ? 'archive.zip' : `archive.z${String(volumeIndex).padStart(2, '0')}`
+
+    splitVolumes.push({
+      name: volumeName,
+      blob: new Blob([volumeData], { type: 'application/zip' }),
+      size: volumeData.length,
+      index: volumeIndex,
+      isLast
+    })
+  }
+
+  if (metadataSize > 0) {
+    const lastVolumeData = concatUint8Arrays([centralDirData, eocd])
+    splitVolumes.push({
+      name: 'archive.zip',
+      blob: new Blob([lastVolumeData], { type: 'application/zip' }),
+      size: lastVolumeData.length,
+      index: splitVolumes.length + 1,
+      isLast: true
+    })
+  }
+
+  if (splitVolumes.length === 1) {
+    const finalData = concatUint8Arrays([
+      ...fileResults.flatMap(r => [r.localHeader, r.fileData]),
+      centralDirData,
+      eocd
+    ])
+    const singleBlob = new Blob([finalData], { type: 'application/zip' })
+    return {
+      blob: singleBlob,
+      splitVolumes: []
+    }
+  }
+
+  const allVolumeData = splitVolumes.map(v => new Uint8Array(0))
+  const totalData = concatUint8Arrays([
+    ...fileResults.flatMap(r => [r.localHeader, r.fileData]),
+    centralDirData,
+    eocd
+  ])
+  const fullBlob = new Blob([totalData], { type: 'application/zip' })
+
+  return {
+    blob: fullBlob,
+    splitVolumes
+  }
 }
 
 export async function createZipStream(

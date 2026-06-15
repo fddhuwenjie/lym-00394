@@ -5,7 +5,8 @@ import type {
   ExtractFilePayload,
   CreateZipPayload,
   ProgressData,
-  ZipFileEntry
+  ZipFileEntry,
+  SplitVolumeFile
 } from '@/types'
 import ZipWorker from '@/workers/zip-worker.ts?worker'
 
@@ -165,6 +166,7 @@ export class ZipWorkerClient {
     type: string
     blob: Blob
     size: number
+    splitVolumes?: SplitVolumeFile[]
   }> {
     const id = this.generateId()
     const command: WorkerCommand = {

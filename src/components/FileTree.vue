@@ -92,7 +92,8 @@ defineExpose({
           :class="{ 
             'directory': item.isDirectory,
             'expanded': item.expanded,
-            'selected': item.selected 
+            'selected': item.selected,
+            'active': item.active
           }"
           @click="handleItemClick(item)"
         >
@@ -190,6 +191,19 @@ defineExpose({
 
 .tree-item.selected {
   background-color: var(--primary-light);
+}
+
+.tree-item.active {
+  background-color: var(--primary-color);
+  color: white;
+}
+
+.tree-item.active .item-name {
+  color: white;
+}
+
+.tree-item.active .item-size {
+  color: rgba(255, 255, 255, 0.8);
 }
 
 .item-content {

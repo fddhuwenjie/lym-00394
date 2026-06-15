@@ -12,7 +12,7 @@ const props = withDefaults(defineProps<Props>(), {
 })
 
 const emit = defineEmits<{
-  (e: 'create', options: { password: string; encryptionMode: string; compressionLevel: number }): void
+  (e: 'create', options: { password: string; encryptionMode: string; compressionLevel: number; splitVolumeSize?: number }): void
   (e: 'clear'): void
 }>()
 
@@ -20,6 +20,39 @@ const password = ref('')
 const showPassword = ref(false)
 const encryptionMode = ref<'none' | 'zipcrypto' | 'aes256'>('none')
 const compressionLevel = ref(6)
+const enableSplitVolume = ref(false)
+const splitVolumePreset = ref('100')
+const customVolumeSize = ref('')
+
+const VOLUME_PRESETS = [
+  { label: '10 MB', value: '10' },
+  { label: '50 MB', value: '50' },
+  { label: '100 MB', value: '100' },
+  { label: '256 MB', value: '256' },
+  { label: '500 MB', value: '500' },
+  { label: '1 GB', value: '1024' },
+  { label: '自定义', value: 'custom' }
+]
+
+const splitVolumeSizeBytes = computed(() => {
+  if (!enableSplitVolume.value) return undefined
+  let mb: number
+  if (splitVolumePreset.value === 'custom') {
+    mb = parseFloat(customVolumeSize.value) || 0
+  } else {
+    mb = parseFloat(splitVolumePreset.value) || 0
+  }
+  if (mb <= 0) return undefined
+  return Math.floor(mb * 1024 * 1024)
+})
+
+const estimatedVolumes = computed(() => {
+  if (!splitVolumeSizeBytes.value || props.files.length === 0) return null
+  const total = props.files.reduce((sum, f) => sum + f.size, 0)
+  const ratio = compressionLevel.value === 0 ? 1 : 0.6
+  const estimatedCompressed = Math.max(total * ratio, 1)
+  return Math.ceil(estimatedCompressed / splitVolumeSizeBytes.value)
+})
 
 const totalSize = computed(() => {
   return props.files.reduce((sum, f) => sum + f.size, 0)
@@ -29,7 +62,8 @@ function handleCreate() {
   emit('create', {
     password: password.value,
     encryptionMode: encryptionMode.value,
-    compressionLevel: compressionLevel.value
+    compressionLevel: compressionLevel.value,
+    splitVolumeSize: splitVolumeSizeBytes.value
   })
 }
 </script>
@@ -124,11 +158,63 @@ function handleCreate() {
           💡 AES-256 安全性更高，但部分旧版解压软件可能不支持
         </p>
       </div>
+
+      <div class="form-group">
+        <div class="checkbox-wrapper">
+          <label class="checkbox-label">
+            <input 
+              type="checkbox" 
+              v-model="enableSplitVolume"
+              :disabled="disabled"
+            />
+            <span>启用分卷压缩</span>
+          </label>
+        </div>
+        <p class="hint">
+          📦 分卷 ZIP 格式：.z01, .z02, ..., .zip（最后一卷含目录结构）
+        </p>
+      </div>
+
+      <div v-if="enableSplitVolume" class="split-volume-options">
+        <div class="form-group">
+          <label class="form-label">每卷大小</label>
+          <div class="volume-presets">
+            <button
+              v-for="preset in VOLUME_PRESETS"
+              :key="preset.value"
+              type="button"
+              class="preset-btn"
+              :class="{ active: splitVolumePreset === preset.value }"
+              :disabled="disabled"
+              @click="splitVolumePreset = preset.value"
+            >
+              {{ preset.label }}
+            </button>
+          </div>
+          <div v-if="splitVolumePreset === 'custom'" class="custom-volume-input">
+            <input
+              v-model.number="customVolumeSize"
+              type="number"
+              min="1"
+              step="1"
+              class="form-input"
+              placeholder="输入自定义大小"
+              :disabled="disabled"
+            />
+            <span class="unit-label">MB</span>
+          </div>
+        </div>
+        <div v-if="estimatedVolumes !== null" class="volume-estimate">
+          <span class="estimate-label">预估分卷数：</span>
+          <span class="estimate-value">{{ estimatedVolumes }} 个</span>
+          <span class="estimate-hint">（基于压缩率估算，实际可能不同）</span>
+        </div>
+      </div>
     </div>
     
     <button 
       class="btn btn-primary btn-lg create-btn"
-      :disabled="files.length === 0 || disabled || (encryptionMode !== 'none' && !password)"
+      :disabled="files.length === 0 || disabled || (encryptionMode !== 'none' && !password) || (enableSplitVolume && !splitVolumeSizeBytes)"
       @click="handleCreate"
     >
       🗜️ 生成 ZIP 文件
@@ -336,5 +422,115 @@ function handleCreate() {
 
 .create-btn {
   width: 100%;
+}
+
+.checkbox-wrapper {
+  display: flex;
+  align-items: center;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.checkbox-label input {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--primary-color);
+}
+
+.checkbox-label:has(input:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.split-volume-options {
+  padding-top: 4px;
+  border-top: 1px solid var(--border-color);
+  margin-top: 8px;
+}
+
+.volume-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.preset-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  background-color: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  transition: all var(--transition-fast);
+}
+
+.preset-btn:hover:not(:disabled) {
+  border-color: var(--primary-color);
+  color: var(--primary-color);
+}
+
+.preset-btn.active {
+  background-color: var(--primary-color);
+  border-color: var(--primary-color);
+  color: white;
+}
+
+.preset-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.custom-volume-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.custom-volume-input input {
+  flex: 1;
+}
+
+.unit-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.volume-estimate {
+  padding: 8px 12px;
+  background-color: var(--primary-light);
+  border-radius: var(--border-radius);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.estimate-label {
+  color: var(--text-secondary);
+}
+
+.estimate-value {
+  font-weight: 600;
+  color: var(--primary-color);
+}
+
+.estimate-hint {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 </style>

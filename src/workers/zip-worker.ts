@@ -18,7 +18,7 @@ import {
   buildFileTree
 } from '@/core/zip-parser'
 import { extractFileToBlob, extractFileToStream } from '@/core/stream-utils'
-import { createZipArchive } from '@/core/zip-packer'
+import { createZipArchive, createSplitZipArchive } from '@/core/zip-packer'
 
 let isCancelled = false
 let activeCommandId: string | null = null
@@ -243,13 +243,24 @@ async function handleCreateZip(commandId: string, payload: CreateZipPayload): Pr
       })
     }
 
-    const blob = await createZipArchive(payload, onProgress)
+    if (payload.splitVolumeSize && payload.splitVolumeSize > 0) {
+      const result = await createSplitZipArchive(payload, onProgress)
 
-    sendResult(commandId, {
-      type: 'CREATE_COMPLETE',
-      blob,
-      size: blob.size
-    })
+      sendResult(commandId, {
+        type: 'CREATE_COMPLETE',
+        blob: result.blob,
+        size: result.blob.size,
+        splitVolumes: result.splitVolumes
+      })
+    } else {
+      const blob = await createZipArchive(payload, onProgress)
+
+      sendResult(commandId, {
+        type: 'CREATE_COMPLETE',
+        blob,
+        size: blob.size
+      })
+    }
   } catch (error: any) {
     sendError(commandId, error)
   } finally {

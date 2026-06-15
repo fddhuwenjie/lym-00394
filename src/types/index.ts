@@ -90,6 +90,7 @@ export interface CreateZipPayload {
   password?: string
   encryptionMode: 'aes256' | 'zipcrypto' | 'none'
   compressionLevel: number
+  splitVolumeSize?: number
 }
 
 export interface ProgressData {
@@ -110,6 +111,7 @@ export interface ExtractResult {
 export interface CreateZipResult {
   blob: Blob
   size: number
+  splitVolumes?: SplitVolumeFile[]
 }
 
 export type TreeData = {
@@ -121,4 +123,25 @@ export type TreeData = {
   entry?: ZipFileEntry
   selected: boolean
   expanded: boolean
+  active?: boolean
+}
+
+export interface SplitVolumeFile {
+  name: string
+  blob: Blob
+  size: number
+  index: number
+  isLast: boolean
+}
+
+export type PreviewFileType = 'text' | 'image' | 'code' | 'unsupported'
+
+export interface FilePreviewData {
+  entry: ZipFileEntry
+  type: PreviewFileType
+  content?: string
+  imageUrl?: string
+  language?: string
+  loading: boolean
+  error?: string
 }

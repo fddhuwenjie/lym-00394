@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import type { ZipFileEntry, TreeData, ProgressData } from '@/types'
+import type { ZipFileEntry, TreeData, ProgressData, FilePreviewData, PreviewFileType, SplitVolumeFile } from '@/types'
 import { getZipWorkerClient } from '@/core/worker-client'
-import { extractFileToStream } from '@/core/stream-utils'
-import { downloadStream, formatFileSize } from '@/utils/download'
+import { extractFileToStream, extractFileToBlob } from '@/core/stream-utils'
+import { downloadStream, formatFileSize, downloadBlob } from '@/utils/download'
 import FileTree from '@/components/FileTree.vue'
 import ProgressBar from '@/components/ProgressBar.vue'
 import PasswordModal from '@/components/PasswordModal.vue'
 import PackPanel from '@/components/PackPanel.vue'
+import FilePreview from '@/components/FilePreview.vue'
 
 const activeTab = ref<'extract' | 'pack'>('extract')
 const isDragging = ref(false)
@@ -25,8 +26,155 @@ const pendingPasswordAction = ref<null | { type: 'parse' | 'extract'; entry?: Zi
 
 const packFiles = ref<File[]>([])
 
+const previewData = ref<FilePreviewData | null>(null)
+const activePreviewEntry = ref<TreeData | null>(null)
+const createdSplitVolumes = ref<SplitVolumeFile[]>([])
+
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const packFileInputRef = ref<HTMLInputElement | null>(null)
+
+const TEXT_EXTENSIONS = ['txt', 'md', 'markdown', 'json', 'csv', 'xml', 'yaml', 'yml', 'toml', 'ini', 'conf', 'cfg', 'log', 'env', 'gitignore']
+const CODE_EXTENSIONS = ['js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'vue', 'svelte', 'html', 'htm', 'css', 'scss', 'less', 'py', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'php', 'rb', 'swift', 'kt', 'sql', 'sh', 'bash', 'zsh', 'fish', 'bat', 'cmd', 'ps1', 'lua', 'pl', 'r', 'dart', 'ex', 'exs', 'erl', 'hs', 'scala', 'clj', 'lisp', 'el', 'vim', 'vimrc', 'Makefile', 'Dockerfile']
+const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico', 'avif']
+
+function getPreviewFileType(filename: string): PreviewFileType {
+  const ext = filename.toLowerCase().split('.').pop() || ''
+  if (IMAGE_EXTENSIONS.includes(ext)) return 'image'
+  if (CODE_EXTENSIONS.includes(ext)) return 'code'
+  if (TEXT_EXTENSIONS.includes(ext)) return 'text'
+  if (filename === 'Makefile' || filename === 'Dockerfile' || filename.startsWith('.') || ext.length === 0) return 'text'
+  return 'unsupported'
+}
+
+const MAX_PREVIEW_SIZE = 2 * 1024 * 1024
+
+function setActiveItem(items: TreeData[], target: TreeData | null) {
+  function walk(list: TreeData[]) {
+    for (const item of list) {
+      item.active = item === target
+      if (item.children && item.children.length > 0) {
+        walk(item.children)
+      }
+    }
+  }
+  walk(items)
+}
+
+async function handleTreeItemClick(item: TreeData) {
+  if (item.isDirectory) return
+  if (!zipFile.value) return
+
+  setActiveItem(treeData.value, item)
+  activePreviewEntry.value = item
+
+  const entry = item.entry
+  if (!entry) return
+
+  const previewType = getPreviewFileType(entry.name)
+
+  previewData.value = {
+    entry,
+    type: previewType,
+    loading: true
+  }
+
+  if (previewType === 'unsupported') {
+    previewData.value.loading = false
+    return
+  }
+
+  if (entry.encrypted) {
+    if (!currentPassword.value) {
+      previewData.value = {
+        entry,
+        type: 'unsupported',
+        loading: false,
+        error: '加密文件需要先输入密码才能预览'
+      }
+      return
+    }
+  }
+
+  try {
+    if (previewType === 'image') {
+      const limitSize = Math.min(entry.size, MAX_PREVIEW_SIZE)
+      const result = await extractFileToBlob(zipFile.value, {
+        entry,
+        password: currentPassword.value || undefined,
+        verifyCRC: false
+      })
+      const url = URL.createObjectURL(result.blob)
+      previewData.value = {
+        entry,
+        type: 'image',
+        imageUrl: url,
+        loading: false
+      }
+    } else {
+      const result = await extractFileToStream(zipFile.value, {
+        entry,
+        password: currentPassword.value || undefined
+      })
+
+      const reader = result.stream.getReader()
+      const chunks: Uint8Array[] = []
+      let totalRead = 0
+
+      while (totalRead < MAX_PREVIEW_SIZE) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          const remaining = MAX_PREVIEW_SIZE - totalRead
+          if (value.length > remaining) {
+            chunks.push(value.slice(0, remaining))
+            totalRead += remaining
+          } else {
+            chunks.push(value)
+            totalRead += value.length
+          }
+        }
+      }
+      reader.cancel()
+
+      let combinedSize = 0
+      for (const c of chunks) combinedSize += c.length
+      const combined = new Uint8Array(combinedSize)
+      let offset = 0
+      for (const c of chunks) {
+        combined.set(c, offset)
+        offset += c.length
+      }
+
+      const text = new TextDecoder('utf-8', { fatal: false }).decode(combined)
+      previewData.value = {
+        entry,
+        type: previewType,
+        content: text,
+        loading: false
+      }
+    }
+  } catch (error: any) {
+    previewData.value = {
+      entry,
+      type: 'unsupported',
+      loading: false,
+      error: '预览失败: ' + (error.message || String(error))
+    }
+  }
+}
+
+function handlePreviewClose() {
+  setActiveItem(treeData.value, null)
+  activePreviewEntry.value = null
+  if (previewData.value?.imageUrl) {
+    URL.revokeObjectURL(previewData.value.imageUrl)
+  }
+  previewData.value = null
+}
+
+function downloadSplitVolume(volume: SplitVolumeFile) {
+  downloadBlob(volume.blob, volume.name)
+}
 
 const parseProgress = ref<ProgressData>({
   bytesProcessed: 0,
@@ -352,10 +500,11 @@ async function downloadSingleFile(entry: ZipFileEntry, password?: string) {
   }
 }
 
-async function handleCreateZip(options: { password: string; encryptionMode: string; compressionLevel: number }) {
+async function handleCreateZip(options: { password: string; encryptionMode: string; compressionLevel: number; splitVolumeSize?: number }) {
   if (packFiles.value.length === 0) return
 
   isCreating.value = true
+  createdSplitVolumes.value = []
   createProgress.value = {
     bytesProcessed: 0,
     totalBytes: packFiles.value.reduce((sum, f) => sum + f.size, 0),
@@ -370,7 +519,8 @@ async function handleCreateZip(options: { password: string; encryptionMode: stri
         files: packFiles.value,
         password: options.password || undefined,
         encryptionMode: options.encryptionMode as any,
-        compressionLevel: options.compressionLevel
+        compressionLevel: options.compressionLevel,
+        splitVolumeSize: options.splitVolumeSize
       },
       {
         onProgress: (progress) => {
@@ -380,12 +530,16 @@ async function handleCreateZip(options: { password: string; encryptionMode: stri
     )
 
     if (result.type === 'CREATE_COMPLETE') {
-      const url = URL.createObjectURL(result.blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = 'archive.zip'
-      a.click()
-      setTimeout(() => URL.revokeObjectURL(url), 60000)
+      if (result.splitVolumes && result.splitVolumes.length > 0) {
+        createdSplitVolumes.value = result.splitVolumes
+      } else {
+        const url = URL.createObjectURL(result.blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = 'archive.zip'
+        a.click()
+        setTimeout(() => URL.revokeObjectURL(url), 60000)
+      }
     }
   } catch (error: any) {
     console.error('Create zip error:', error)
@@ -404,6 +558,11 @@ function closeZip() {
   zipEntries.value = []
   treeData.value = []
   currentPassword.value = ''
+  if (previewData.value?.imageUrl) {
+    URL.revokeObjectURL(previewData.value.imageUrl)
+  }
+  previewData.value = null
+  activePreviewEntry.value = null
 }
 
 onMounted(() => {
@@ -502,12 +661,21 @@ onUnmounted(() => {
               <h3 class="section-title">📋 文件列表</h3>
               <span class="entry-count">{{ zipEntries.length }} 个项目</span>
             </div>
-            <div class="file-tree-wrapper">
-              <FileTree
-                :items="treeData"
-                :show-download="true"
-                @download="handleDownload"
-              />
+            <div class="content-with-preview">
+              <div class="file-tree-wrapper">
+                <FileTree
+                  :items="treeData"
+                  :show-download="true"
+                  @download="handleDownload"
+                  @item-click="handleTreeItemClick"
+                />
+              </div>
+              <div class="preview-wrapper">
+                <FilePreview
+                  :preview-data="previewData"
+                  @close="handlePreviewClose"
+                />
+              </div>
             </div>
           </div>
 
@@ -570,6 +738,32 @@ onUnmounted(() => {
             <div class="create-size">
               {{ formatFileSize(createProgress.bytesProcessed) }} / {{ formatFileSize(createProgress.totalBytes) }}
             </div>
+          </div>
+
+          <div v-if="createdSplitVolumes.length > 0" class="split-volumes-section">
+            <div class="section-header">
+              <h3 class="section-title">📦 分卷文件</h3>
+              <span class="entry-count">{{ createdSplitVolumes.length }} 个分卷</span>
+            </div>
+            <div class="split-volumes-list">
+              <div v-for="volume in createdSplitVolumes" :key="volume.name" class="split-volume-item">
+                <div class="volume-info">
+                  <span class="volume-icon">{{ volume.isLast ? '📦' : '📄' }}</span>
+                  <div class="volume-details">
+                    <span class="volume-name">{{ volume.name }}</span>
+                    <span class="volume-size">{{ formatFileSize(volume.size) }}</span>
+                  </div>
+                  <span v-if="volume.isLast" class="volume-badge badge badge-info">最后一卷 (含目录)</span>
+                  <span v-else class="volume-badge badge badge-success">数据卷</span>
+                </div>
+                <button class="btn btn-primary btn-sm" @click="downloadSplitVolume(volume)">
+                  ⬇️ 下载
+                </button>
+              </div>
+            </div>
+            <button class="btn btn-secondary download-all-btn" @click="() => createdSplitVolumes.forEach(v => downloadSplitVolume(v))">
+              📥 下载全部分卷
+            </button>
           </div>
         </div>
       </div>
@@ -892,6 +1086,116 @@ onUnmounted(() => {
   margin-top: 8px;
 }
 
+.content-with-preview {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  height: 500px;
+}
+
+.file-tree-wrapper {
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  height: 100%;
+}
+
+.preview-wrapper {
+  height: 100%;
+}
+
+.split-volumes-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background-color: var(--bg-secondary);
+  border-radius: var(--border-radius);
+}
+
+.split-volumes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.split-volume-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  transition: all var(--transition-fast);
+}
+
+.split-volume-item:hover {
+  border-color: var(--primary-color);
+  box-shadow: var(--shadow-sm);
+}
+
+.volume-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+.volume-icon {
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.volume-details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.volume-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volume-size {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.volume-badge {
+  flex-shrink: 0;
+}
+
+.download-all-btn {
+  align-self: flex-end;
+}
+
+@media (max-width: 900px) {
+  .content-with-preview {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto;
+    height: auto;
+  }
+
+  .file-tree-wrapper {
+    max-height: 400px;
+  }
+
+  .preview-wrapper {
+    height: 400px;
+  }
+}
+
 @media (max-width: 640px) {
   .app-header {
     padding: 16px;
@@ -907,6 +1211,15 @@ onUnmounted(() => {
 
   .content-area {
     padding: 16px;
+  }
+
+  .split-volume-item {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .download-all-btn {
+    align-self: stretch;
   }
 }
 </style>
